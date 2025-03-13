@@ -107,7 +107,7 @@ spec:
         - kind: WORKDIR
           value: /opt/nuclio
         - kind: RUN
-          value: wget https://github.com/sygstat/yolov11-seg-nuclio/raw/refs/heads/main/model/yolov11n-seg.onnx
+          value: wget https://github.com/sygstat/yolov11-seg-nuclio/raw/refs/heads/main/model/yolo11n-seg.onnx
         - kind: RUN
           value: ln -s /usr/bin/python3 /usr/bin/python
 
