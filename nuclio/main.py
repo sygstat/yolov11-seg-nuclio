@@ -38,8 +38,14 @@ def handler(context, event):
         # Open the image
         image = Image.open(buf)
         
-        # Run inference
-        results = context.user_data.model.infer(image, threshold)
+        # Convert PIL image to numpy array (BGR format for OpenCV compatibility)
+        image_np = np.array(image)
+        # PIL는 RGB 형식이고 OpenCV는 BGR 형식을 사용하므로 색상 채널 변환
+        if image_np.shape[2] == 3:  # RGB 이미지인 경우만 변환
+            image_np = image_np[:, :, ::-1].copy()  # RGB to BGR
+        
+        # Run inference with numpy array
+        results = context.user_data.model.infer(image_np, threshold)
         
         return context.Response(
             body=json.dumps(results),
