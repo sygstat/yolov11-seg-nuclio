@@ -1,23 +1,26 @@
 import cv2
-import numpy as np
-import onnxruntime as ort
 import torch
-from PIL import Image
-import base64
+import numpy as np
+import supervision as sv
+import onnxruntime as ort
+import ultralytics.utils.ops as ops
 
+from ultralytics.engine.results import Results
+from skimage.measure import approximate_polygon, find_contours
 
 class ModelHandler:
     def __init__(self, labels):
         self.model = None
-        self.load_network(model="yolo11n-seg.onnx")
+        self.load_network(model='yolo11n-seg.onnx')
         self.labels = labels
         self.input_size = (640, 640)
+        self.conf = 0.25
+        self.iou = 0.7
 
     def load_network(self, model):
         device = ort.get_device()
-        #cuda = True if device == 'GPU' else False
         try:
-            providers = ['CPUExecutionProvider'] #['CUDAExecutionProvider', 'CPUExecutionProvider'] if cuda else ['CPUExecutionProvider']
+            providers = ['CPUExecutionProvider']
             so = ort.SessionOptions()
             so.log_severity_level = 3
 
@@ -29,255 +32,124 @@ class ModelHandler:
         except Exception as e:
             raise Exception(f"Cannot load model {model}: {e}")
 
-    def letterbox(self, im, new_shape=(640, 640), color=(114, 114, 114), auto=True, scaleup=True, stride=32):
-        # Resize and pad image while meeting stride-multiple constraints
-        shape = im.shape[:2]  # current shape [height, width]
-        if isinstance(new_shape, int):
-            new_shape = (new_shape, new_shape)
+    def letterbox(self, img, new_shape=(640, 640)):
+        """
+        Resizes and pads image while maintaining aspect ratio.
+
+        Args:
+            img (np.ndarray): Input image in BGR format.
+            new_shape (tuple): Target shape as (height, width).
+
+        Returns:
+            (np.ndarray): Resized and padded image.
+        """
+        shape = img.shape[:2]  # current shape [height, width]
 
         # Scale ratio (new / old)
         r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
-        if not scaleup:  # only scale down, do not scale up (for better val mAP)
-            r = min(r, 1.0)
 
         # Compute padding
         new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
-        dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
-
-        if auto:  # minimum rectangle
-            dw, dh = np.mod(dw, stride), np.mod(dh, stride)  # wh padding
-
-        dw /= 2  # divide padding into 2 sides
-        dh /= 2
+        dw, dh = (new_shape[1] - new_unpad[0]) / 2, (new_shape[0] - new_unpad[1]) / 2  # wh padding
 
         if shape[::-1] != new_unpad:  # resize
-            im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)
+            img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
         top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
         left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
-        im = cv2.copyMakeBorder(im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
-        return im, r, (dw, dh)
+        img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
 
+        return img
+
+    def preprocess(self, img, new_shape):
+        """
+        Preprocesses the input image before feeding it into the model.
+
+        Args:
+            img (np.ndarray): The input image in BGR format.
+            new_shape (tuple): The target shape for resizing as (height, width).
+
+        Returns:
+            (np.ndarray): Preprocessed image ready for model inference, with shape (1, 3, height, width) and normalized.
+        """
+        img = self.letterbox(img, new_shape)
+        img = img[..., ::-1].transpose([2, 0, 1])[None]  # BGR to RGB, BHWC to BCHW
+        img = np.ascontiguousarray(img)
+        img = img.astype(np.float32) / 255  # Normalize to [0, 1]
+        return img
+    
     def process_mask(self, protos, masks_in, bboxes, shape):
-        """
-        Process prototype masks with predicted mask coefficients to generate instance segmentation masks.
-        
-        Args:
-            protos (np.ndarray): Prototype masks from model output
-            masks_in (np.ndarray): Predicted mask coefficients
-            bboxes (np.ndarray): Bounding boxes in xyxy format
-            shape (tuple): Original image shape (h, w)
-            
-        Returns:
-            np.ndarray: Binary segmentation masks
-        """
+
         c, mh, mw = protos.shape  # CHW
-        
-        # Convert to torch tensors for processing
-        protos_tensor = torch.from_numpy(protos)
-        masks_in_tensor = torch.from_numpy(masks_in)
-        
-        # Matrix multiplication and reshape
-        masks = (masks_in_tensor @ protos_tensor.float().view(c, -1)).view(-1, mh, mw)
-        
-        # Scale masks to original image size
-        ih, iw = shape
-        masks = torch.nn.functional.interpolate(masks.unsqueeze(0), (ih, iw), mode='bilinear', align_corners=False)[0]
-        
-        # Crop masks to bounding boxes
-        bboxes_tensor = torch.from_numpy(bboxes).to(torch.int)
-        
-        final_masks = []
-        for i, bbox in enumerate(bboxes_tensor):
-            x1, y1, x2, y2 = bbox
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(iw, x2)
-            y2 = min(ih, y2)
-            
-            mask = masks[i]
-            mask_crop = mask[y1:y2, x1:x2]
-            padded_mask = torch.zeros((ih, iw), device=mask.device, dtype=mask.dtype)
-            padded_mask[y1:y2, x1:x2] = mask_crop
-            final_masks.append(padded_mask > 0.5)  # Binarize mask
-        
-        if final_masks:
-            return torch.stack(final_masks).cpu().numpy()
-        else:
-            return np.zeros((0, ih, iw), dtype=bool)
+        masks = (masks_in @ protos.float().view(c, -1)).view(-1, mh, mw)  # Matrix multiplication
+        masks = ops.scale_masks(masks[None], shape)[0]  # Scale masks to original image size
+        masks = ops.crop_mask(masks, bboxes)  # Crop masks to bounding boxes
+        return masks.gt_(0.0)  # Convert to binary masks
 
-    def _infer(self, image):
-        try:
-            # Prepare image for inference
-            img = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-            h0, w0 = img.shape[:2]  # Original image shape
-            
-            # Letterbox and preprocess
-            img_lb, ratio, (dw, dh) = self.letterbox(img, self.input_size, auto=False)
-            img_lb = img_lb.transpose((2, 0, 1))  # HWC to CHW
-            img_lb = np.ascontiguousarray(img_lb)
-            img_lb = img_lb.astype(np.float32) / 255.0  # Normalize
-            
-            # Add batch dimension
-            img_lb = np.expand_dims(img_lb, 0)
-            
-            # Run model inference
-            inp = {self.input_details[0]: img_lb}
-            outputs = self.model.run(self.output_details, inp)
-            
-            # Process segmentation outputs
-            predictions = outputs[0]  # Detections with shape (1, num_detections, 6+num_classes+mask_dim)
-            proto = outputs[1]  # Prototype masks with shape (1, mask_dim, mask_h, mask_w)
-            
-            # Process predictions
-            pred = np.squeeze(predictions, axis=0)  # Remove batch dimension
-            proto = np.squeeze(proto, axis=0)  # Remove batch dimension
-            
-            # Extract boxes, scores, classes, and mask coefficients
-            keep_idx = pred[:, 4] > 0.001  # Basic confidence filtering
-            if not np.any(keep_idx):
-                return [], [], [], []
-            
-            pred = pred[keep_idx]
-            
-            # Extract coordinates, confidence scores, class IDs and masks
-            boxes = pred[:, :4]  # Boxes in xywh format
-            scores = pred[:, 4]
-            class_ids = pred[:, 5:5+len(self.labels)].argmax(axis=1)
-            mask_coeffs = pred[:, 5+len(self.labels):]  # Mask coefficients
-            
-            # Convert boxes from center format to corner format
-            x_center, y_center, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-            boxes = np.stack([
-                x_center - w/2,  # x1
-                y_center - h/2,  # y1
-                x_center + w/2,  # x2
-                y_center + h/2   # y2
-            ], axis=1)
-            
-            # Adjust box coordinates for padding
-            boxes[:, [0, 2]] -= dw  # Adjust x coordinates
-            boxes[:, [1, 3]] -= dh  # Adjust y coordinates
-            
-            # Rescale boxes to original image dimensions
-            boxes = boxes / ratio
-            
-            # Process masks
-            masks = self.process_mask(proto, mask_coeffs, boxes, (h0, w0))
-            
-            return boxes, class_ids, scores, masks
-            
-        except Exception as e:
-            print(f"Inference error: {e}")
-            import traceback
-            traceback.print_exc()
-            return [], [], [], []
-
-    def to_cvat_mask(self, bbox, mask):
+    def postprocess(self, img, prep_img, outs):
         """
-        Converts a binary mask to CVAT's Run-Length Encoded (RLE) format
-        
+        Post-processes model predictions to extract meaningful results.
+
         Args:
-            bbox (list): Bounding box in format [x1, y1, x2, y2]
-            mask (np.ndarray): Binary mask as numpy array
-            
-        Returns:
-            str: Base64 encoded RLE mask
-        """
-        x, y, w, h = int(bbox[0]), int(bbox[1]), int(bbox[2] - bbox[0]), int(bbox[3] - bbox[1])
-        mask_crop = mask[y:y+h, x:x+w]
-        
-        # RLE encoding
-        mask_rle = []
-        last_val = 0
-        count = 0
-        
-        for i in range(mask_crop.size):
-            # Get value (0 or 1) at position i
-            val = mask_crop.flat[i]
-            
-            # If same as last value, increment count
-            if val == last_val:
-                count += 1
-            else:
-                # Store the count of the last value
-                mask_rle.append(count)
-                # Update last value and reset count
-                last_val = val
-                count = 1
-        
-        # Don't forget the last run
-        mask_rle.append(count)
-        
-        # If first value is 1, prepend a 0 count
-        if mask_crop.flat[0] == 1:
-            mask_rle = [0] + mask_rle
-            
-        # Convert RLE to bytes
-        rle_bytes = bytes(mask_rle)
-        
-        # Encode as base64
-        return base64.b64encode(rle_bytes).decode('utf-8')
+            img (np.ndarray): The original input image.
+            prep_img (np.ndarray): The preprocessed image used for inference.
+            outs (List): Model outputs containing predictions and prototype masks.
 
-    def find_contours(self, mask):
-        """
-        Find contours in a binary mask
-        
-        Args:
-            mask (np.ndarray): Binary mask
-            
         Returns:
-            np.ndarray: Contour points
+            (List[Results]): Processed detection results containing bounding boxes and segmentation masks.
         """
-        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return np.array([])
-            
-        # Get the largest contour
-        contour = max(contours, key=cv2.contourArea)
-        contour = np.squeeze(contour, axis=1)
-        return contour
+        preds, protos = [torch.from_numpy(p) for p in outs]
+        #preds, protos = [p for p in outs]
 
-    def infer(self, image, threshold):
-        # Convert PIL image to numpy array
-        if isinstance(image, Image.Image):
-            image = np.array(image)
+        preds = ops.non_max_suppression(preds, self.conf, self.iou, nc=len(self.labels))
         
-        h, w = image.shape[:2]
-        boxes, class_ids, scores, masks = self._infer(image)
+        print(preds)
+        print(protos.shape)
         
         results = []
+        for i, pred in enumerate(preds):
+            pred[:, :4] = ops.scale_boxes(prep_img.shape[2:], pred[:, :4], img.shape)
+            masks = self.process_mask(protos[i], pred[:, 6:], pred[:, :4], img.shape[:2])
+            results.append(Results(img, path="", names=self.labels, boxes=pred[:, :6], masks=masks))
+
+        return results
+    
+    def to_cvat_mask(self, box: list, mask):
+        xtl, ytl, xbr, ybr = box
+        flattened = mask[ytl:ybr + 1, xtl:xbr + 1].flat[:].tolist()
+        flattened.extend([xtl, ytl, xbr, ybr])
+        return flattened
+    
+    def infer(self, image, threshold):
+        prep_img = self.preprocess(image, new_shape = self.input_size)
+        outs = self.model.run(None, {self.model.get_inputs()[0].name: prep_img})
+        result = self.postprocess(image, prep_img, outs)
         
-        for box, class_id, score, mask in zip(boxes, class_ids, scores, masks):
-            if score < threshold:
-                continue
-                
-            # Convert to integer coordinates
-            x1, y1, x2, y2 = map(int, [max(0, box[0]), max(0, box[1]), 
-                                      min(w, box[2]), min(h, box[3])])
-            
-            # Skip too small detections
-            if x2 <= x1 or y2 <= y1 or (x2 - x1) * (y2 - y1) < 10:
-                continue
-                
-            # Create binary mask and find contours
-            binary_mask = mask.astype(np.uint8) * 255
-            contour = self.find_contours(binary_mask)
-            
-            if len(contour) < 3:  # Need at least 3 points for a valid polygon
-                continue
-                
-            # Flip contour to match CVAT format
-            contour = np.flip(contour, axis=1)
-            
-            # Create RLE mask for CVAT
-            cvat_mask = self.to_cvat_mask([x1, y1, x2, y2], binary_mask)
-            
-            results.append({
-                "confidence": str(float(score)),
-                "label": self.labels.get(int(class_id), "unknown"),
-                "points": contour.ravel().tolist(),
-                "mask": cvat_mask,
-                "type": "mask",
-            })
-            
+        detections = sv.Detections.from_ultralytics(result[0])
+        detections = detections[detections.confidence > threshold]
+        
+        results=[]
+        if len(detections) > 0:
+            for xyxy, mask, confidence, class_id, _, _ in detections:
+                mask = mask.astype(np.uint8)
+
+                xtl = int(xyxy[0])
+                ytl = int(xyxy[1])
+                xbr = int(xyxy[2])
+                ybr = int(xyxy[3])
+
+                label = int(class_id)
+                cvat_mask = self.to_cvat_mask((xtl, ytl, xbr, ybr), mask)
+
+                contours = find_contours(mask, 0.5)
+                contour = contours[0]
+                contour = np.flip(contour, axis=1)
+                polygons = approximate_polygon(contour, tolerance=2.5)
+
+                results.append({
+                    "confidence": str(confidence),
+                    "label": self.labels.get(class_id, "unknown"),
+                    "type": "mask",
+                    "points": polygons.ravel().tolist(),
+                    "mask": cvat_mask,
+                })
         return results
