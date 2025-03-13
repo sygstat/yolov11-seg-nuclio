@@ -101,7 +101,7 @@ spec:
         - kind: USER
           value: root
         - kind: RUN
-          value: apt update && apt install --no-install-recommends -y wget python3-pip
+          value: apt update && apt install --no-install-recommends -y wget python3-pip libgl1-mesa-glx libglib2.0-0
         - kind: RUN
           value: pip install onnxruntime opencv-python-headless pyyaml numpy torch scikit-image supervision ultralytics
         - kind: WORKDIR
